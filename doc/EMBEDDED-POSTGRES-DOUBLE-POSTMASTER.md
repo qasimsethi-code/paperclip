@@ -158,6 +158,18 @@ run 5: PASS   55s
 SUMMARY: pass=4 orphan=1 other=0 of 5
 ```
 
+### Third batch on `1c3fd3d36` (docs-only commit atop `6efc5531c`, so same code)
+
+```
+run 1: PASS   65s
+run 2: PASS   75s
+run 3: ORPHAN 54s
+run 4: ORPHAN 20s
+run 5: PASS   53s
+
+SUMMARY: pass=3 orphan=2 other=0 of 5
+```
+
 ### Aggregate
 
 | Commit | Runs | Pass | Orphan |
@@ -165,9 +177,15 @@ SUMMARY: pass=4 orphan=1 other=0 of 5
 | `54f2d398d` | 4 scored (+1 abort) | 2 | 2 |
 | `6efc5531c` batch 1 | 5 | 2 | 3 |
 | `6efc5531c` batch 2 | 5 | 4 | 1 |
-| **total** | **14** | **8** | **6** |
+| `1c3fd3d36` (same code) | 5 | 3 | 2 |
+| **total** | **19** | **11** | **8** |
 
-`6efc5531c` alone: **6 pass / 4 orphan over 10 runs (~40% failure)**.
+**Pooled over the current code (`6efc5531c` / `1c3fd3d36`), n=15: 9 pass / 6 orphan —
+40% failure.**
+
+Per-batch pass rates were 40%, 80%, 60% on identical code. That spread at n=5 is the
+clearest argument against judging this from a single batch; pooled across 15 runs the
+estimate settles near 60% pass / 40% fail.
 
 **Batch-to-batch variance is large.** The same commit produced 2/5 and then 4/5. A single
 5-run batch cannot distinguish a 40% failure rate from 60%, so do not compare commits on
