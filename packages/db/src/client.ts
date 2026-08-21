@@ -252,6 +252,27 @@ export async function waitForPostgresReady(
   }
 }
 
+/**
+ * The data directory a server on `url` serves, waiting briefly for it to finish
+ * starting up first.
+ *
+ * `getPostgresDataDirectory` alone reports `null` for a cluster that is merely
+ * mid-WAL-recovery, which reads identically to "nothing is there" — and that
+ * misreading is what previously sent startup down the path of launching a
+ * second postmaster over a live data directory.
+ */
+export async function getPostgresDataDirectoryWhenReady(
+  url: string,
+  options: { timeoutMs?: number } = {},
+): Promise<string | null> {
+  try {
+    await waitForPostgresReady(url, { timeoutMs: options.timeoutMs ?? 5_000 });
+  } catch {
+    return null;
+  }
+  return await getPostgresDataDirectory(url);
+}
+
 async function listMigrationFiles(): Promise<string[]> {
   const entries = await readdir(MIGRATIONS_FOLDER, { withFileTypes: true });
   return entries

@@ -409,124 +409,97 @@ export async function startServer(): Promise<StartedServer> {
     }
   
     const clusterVersionFile = resolve(dataDir, "PG_VERSION");
+    // Captured before any start, which is what creates PG_VERSION.
     const clusterAlreadyInitialized = existsSync(clusterVersionFile);
-    // A data directory may only ever have one postmaster. Starting a second one
-    // over live data fatals with a duplicate postmaster.pid or a pre-existing
-    // shared memory block, so the lock file is adjudicated before anything is
-    // decided about ports: the port fallback below exists for an unrelated
-    // service holding the port, never for our own cluster.
-    const lockStatus = inspectPostmasterLock(dataDir);
 
-    if (lockStatus.status === "running") {
-      port = lockStatus.lock.port ?? configuredPort;
-      logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${lockStatus.lock.pid}, port=${port})`);
-    } else if (lockStatus.status === "indeterminate") {
-      // Not provably dead. Reuse the recorded server and let the readiness wait
-      // below decide, rather than clearing a lock file we cannot vouch for.
-      port = lockStatus.lock.port ?? configuredPort;
-      logger.warn(
-        { reason: lockStatus.reason, pid: lockStatus.lock.pid, port },
-        "Embedded PostgreSQL lock file could not be adjudicated; reusing the recorded server instead of starting a second one",
-      );
-    } else {
-      if (lockStatus.status === "stale") {
-        const removal = removeStalePostmasterLock(dataDir);
-        if (removal.removed) {
-          logger.warn(
-            { pid: removal.lock.pid },
-            "Removing embedded PostgreSQL lock file left behind by a dead postmaster",
-          );
-        } else {
-          logger.warn({ reason: removal.reason }, "Left the embedded PostgreSQL lock file in place");
-        }
-      }
+    // The data directory, not the port, is what a postmaster owns exclusively.
+    // Picking a different port when the configured one is busy does nothing to
+    // make a second postmaster over the same files safe — PostgreSQL still
+    // fatals with `pre-existing shared memory block is still in use`. So we
+    // either attach to whatever owns this directory, or start on the configured
+    // port, waiting out the teardown window after a watch-mode restart.
+    const createEmbeddedPostgresOn = (selectedPort: number) => new EmbeddedPostgres({
+      databaseDir: dataDir,
+      user: "paperclip",
+      password: "paperclip",
+      port: selectedPort,
+      persistent: true,
+      initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
+      onLog: appendEmbeddedPostgresLog,
+      onError: appendEmbeddedPostgresLog,
+    });
 
-      const configuredAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${configuredPort}/postgres`;
-      try {
-        const actualDataDir = await getPostgresDataDirectory(configuredAdminConnectionString);
-        if (
-          typeof actualDataDir !== "string" ||
-          resolve(actualDataDir) !== resolve(dataDir)
-        ) {
-          throw new Error("reachable postgres does not use the expected embedded data directory");
-        }
-        port = configuredPort;
-        logger.warn(
-          `Embedded PostgreSQL appears to already be reachable without a pid file; reusing existing server on configured port ${configuredPort}`,
-        );
-      } catch {
-        const detectedPort = await detectPort(configuredPort);
-        if (detectedPort !== configuredPort) {
-          logger.warn(`Embedded PostgreSQL port is in use; using next free port (requestedPort=${configuredPort}, selectedPort=${detectedPort})`);
-        }
-        port = detectedPort;
-        logger.info(`Using embedded PostgreSQL because no DATABASE_URL set (dataDir=${dataDir}, port=${port})`);
-        const createEmbeddedPostgres = () => new EmbeddedPostgres({
-          databaseDir: dataDir,
-          user: "paperclip",
-          password: "paperclip",
-          port,
-          persistent: true,
-          initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
-          onLog: appendEmbeddedPostgresLog,
-          onError: appendEmbeddedPostgresLog,
-        });
-        embeddedPostgres = createEmbeddedPostgres();
-
-        if (!clusterAlreadyInitialized) {
-          try {
-            await embeddedPostgres.initialise();
-          } catch (err) {
-            logEmbeddedPostgresFailure("initialise", err);
-            throw formatEmbeddedPostgresError(err, {
-              fallbackMessage: `Failed to initialize embedded PostgreSQL cluster in ${dataDir} on port ${port}`,
-              recentLogs: logBuffer.getRecentLogs(),
-            });
+    let resolvedCluster;
+    try {
+      resolvedCluster = await startOrAdoptEmbeddedPostgres({
+        dataDir,
+        configuredPort,
+        isPortInUse: async (candidate) => (await detectPort(candidate)) !== candidate,
+        probeDataDirectory: (candidate) => getPostgresDataDirectoryWhenReady(
+          `postgres://paperclip:paperclip@127.0.0.1:${candidate}/postgres`,
+        ),
+        isClusterInitialized: () => clusterAlreadyInitialized,
+        getRecentLogs: () => logBuffer.getRecentLogs(),
+        createInstance: createEmbeddedPostgresOn,
+        onAdopt: ({ port: adoptedPort, reason }) => logger.warn(
+          { port: adoptedPort, dataDir },
+          `Embedded PostgreSQL already serves this data directory; reusing it (${reason})`,
+        ),
+        onStart: ({ port: startPort, removedStaleLock }) => {
+          if (removedStaleLock) {
+            logger.warn("Removed embedded PostgreSQL lock file left behind by a dead postmaster");
           }
-        } else {
+          logger.info(`Using embedded PostgreSQL because no DATABASE_URL set (dataDir=${dataDir}, port=${startPort})`);
+          if (!clusterAlreadyInitialized) return;
           logger.info(`Embedded PostgreSQL cluster already exists (${clusterVersionFile}); skipping init`);
-        }
+        },
+        onBusyRetry: ({ elapsedMs }) => logger.warn(
+          { elapsedMs, dataDir },
+          "Embedded PostgreSQL data directory is still being released by a previous postmaster; retrying",
+        ),
+      });
+    } catch (err) {
+      logEmbeddedPostgresFailure("start", err);
+      throw formatEmbeddedPostgresError(err, {
+        fallbackMessage: `Failed to start embedded PostgreSQL for ${dataDir} on port ${configuredPort}`,
+        recentLogs: logBuffer.getRecentLogs(),
+      });
+    }
 
-        try {
-          await embeddedPostgres.start();
-        } catch (err) {
-          logEmbeddedPostgresFailure("start", err);
-          throw formatEmbeddedPostgresError(err, {
-            fallbackMessage: `Failed to start embedded PostgreSQL on port ${port}`,
-            recentLogs: logBuffer.getRecentLogs(),
-          });
-        }
-        embeddedPostgresStartedByThisProcess = true;
-        embeddedPostgresSupervisor = createEmbeddedPostgresSupervisor({
-          initialInstance: embeddedPostgres,
-          createInstance: createEmbeddedPostgres,
-          beforeRestart: () => {
-            const removal = removeStalePostmasterLock(dataDir);
-            if (!removal.removed && inspectPostmasterLock(dataDir).status !== "absent") {
-              throw new Error(`Refusing embedded PostgreSQL recovery: ${removal.reason}`);
-            }
-          },
-          onUnexpectedExit: (code, signal) => logger.error(
-            { code, signal, recentLogs: logBuffer.getRecentLogs() },
-            "Embedded PostgreSQL exited unexpectedly; attempting recovery",
-          ),
-          onRestartAttemptFailed: (err, attempt) => logger.error(
-            { err, attempt, recentLogs: logBuffer.getRecentLogs() },
-            "Embedded PostgreSQL recovery attempt failed",
-          ),
-          onRestarted: (attempt) => logger.info(
-            { attempt, port },
-            "Embedded PostgreSQL recovered after unexpected exit",
-          ),
-          onRecoveryExhausted: (err) => {
-            logger.fatal(
-              { err, recentLogs: logBuffer.getRecentLogs() },
-              "Embedded PostgreSQL recovery exhausted; stopping the unhealthy server",
-            );
-            process.kill(process.pid, "SIGTERM");
-          },
-        });
-      }
+    port = resolvedCluster.port;
+
+    if (resolvedCluster.mode === "started") {
+      embeddedPostgres = resolvedCluster.instance as EmbeddedPostgresInstance;
+      embeddedPostgresStartedByThisProcess = true;
+      embeddedPostgresSupervisor = createEmbeddedPostgresSupervisor({
+        initialInstance: embeddedPostgres,
+        createInstance: () => createEmbeddedPostgresOn(port),
+        beforeRestart: () => {
+          const removal = removeStalePostmasterLock(dataDir);
+          if (!removal.removed && inspectPostmasterLock(dataDir).status !== "absent") {
+            throw new Error(`Refusing embedded PostgreSQL recovery: ${removal.reason}`);
+          }
+        },
+        onUnexpectedExit: (code, signal) => logger.error(
+          { code, signal, recentLogs: logBuffer.getRecentLogs() },
+          "Embedded PostgreSQL exited unexpectedly; attempting recovery",
+        ),
+        onRestartAttemptFailed: (err, attempt) => logger.error(
+          { err, attempt, recentLogs: logBuffer.getRecentLogs() },
+          "Embedded PostgreSQL recovery attempt failed",
+        ),
+        onRestarted: (attempt) => logger.info(
+          { attempt, port },
+          "Embedded PostgreSQL recovered after unexpected exit",
+        ),
+        onRecoveryExhausted: (err) => {
+          logger.fatal(
+            { err, recentLogs: logBuffer.getRecentLogs() },
+            "Embedded PostgreSQL recovery exhausted; stopping the unhealthy server",
+          );
+          process.kill(process.pid, "SIGTERM");
+        },
+      });
     }
   
     const embeddedAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;
